@@ -4,6 +4,7 @@ import path from "path";
 import { config } from "../config.js";
 import { getAllTasks } from "../services/downloadManager.js";
 import { buildManifest, getWhitePng } from "../services/manifestBuilder.js";
+import { readIpaMetadata } from "../services/sinfInjector.js";
 import { getIdParam } from "../utils/route.js";
 
 const router = Router();
@@ -52,7 +53,7 @@ function joinUrl(baseUrl: string, path: string): string {
 }
 
 // Manifest plist for iTMS installation
-router.get("/install/:id/manifest.plist", (req: Request, res: Response) => {
+router.get("/install/:id/manifest.plist", async (req: Request, res: Response) => {
   const id = getIdParam(req);
   const task = getAllTasks().find(
     (t) => t.id === id && t.status === "completed",
@@ -67,9 +68,10 @@ router.get("/install/:id/manifest.plist", (req: Request, res: Response) => {
   const payloadUrl = joinUrl(baseUrl, `/api/install/${id}/payload.ipa`);
   const smallIconUrl = joinUrl(baseUrl, `/api/install/${id}/icon-small.png`);
   const largeIconUrl = joinUrl(baseUrl, `/api/install/${id}/icon-large.png`);
+  const bundleVersion = await readBundleVersion(task.filePath);
 
   const manifest = buildManifest(
-    task.software,
+    { ...task.software, version: bundleVersion ?? task.software.version },
     payloadUrl,
     smallIconUrl,
     largeIconUrl,
@@ -78,6 +80,20 @@ router.get("/install/:id/manifest.plist", (req: Request, res: Response) => {
   res.setHeader("Content-Type", "application/xml");
   res.send(manifest);
 });
+
+/** Đọc CFBundleVersion thật từ IPA để iOS OTA install không nhầm với short version. */
+async function readBundleVersion(ipaPath: string): Promise<string | null> {
+  try {
+    const metadata = await readIpaMetadata(ipaPath);
+    return metadata.info?.bundleVersion ?? null;
+  } catch (err) {
+    console.warn(
+      "Không đọc được CFBundleVersion từ IPA:",
+      err instanceof Error ? err.message : err,
+    );
+    return null;
+  }
+}
 
 router.get("/install/:id/url", (req: Request, res: Response) => {
   const id = getIdParam(req);
@@ -119,13 +135,73 @@ router.get("/install/:id/payload.ipa", (req: Request, res: Response) => {
     return;
   }
 
-  res.setHeader("Content-Type", "application/octet-stream");
   const stats = fs.statSync(resolvedPath);
-  res.setHeader("Content-Length", stats.size);
+  const fileSize = stats.size;
+  const range = req.headers.range;
 
-  const stream = fs.createReadStream(resolvedPath);
+  res.setHeader("Content-Type", "application/octet-stream");
+  res.setHeader("Accept-Ranges", "bytes");
+
+  if (!range) {
+    res.setHeader("Content-Length", fileSize);
+    const stream = fs.createReadStream(resolvedPath);
+    stream.pipe(res);
+    return;
+  }
+
+  const parsedRange = parseByteRange(range, fileSize);
+  if (!parsedRange) {
+    res.status(416);
+    res.setHeader("Content-Range", `bytes */${fileSize}`);
+    res.end();
+    return;
+  }
+
+  const { start, end } = parsedRange;
+  res.status(206);
+  res.setHeader("Content-Range", `bytes ${start}-${end}/${fileSize}`);
+  res.setHeader("Content-Length", end - start + 1);
+
+  const stream = fs.createReadStream(resolvedPath, { start, end });
   stream.pipe(res);
 });
+
+/** Phân tích header Range đơn giản để iOS có thể tải tiếp IPA bằng từng đoạn byte. */
+function parseByteRange(
+  rangeHeader: string,
+  fileSize: number,
+): { start: number; end: number } | null {
+  const match = rangeHeader.match(/^bytes=(\d*)-(\d*)$/);
+  if (!match) return null;
+
+  const [, rawStart, rawEnd] = match;
+  if (!rawStart && !rawEnd) return null;
+
+  let start: number;
+  let end: number;
+
+  if (!rawStart) {
+    const suffixLength = parseInt(rawEnd, 10);
+    if (!Number.isFinite(suffixLength) || suffixLength <= 0) return null;
+    start = Math.max(fileSize - suffixLength, 0);
+    end = fileSize - 1;
+  } else {
+    start = parseInt(rawStart, 10);
+    end = rawEnd ? parseInt(rawEnd, 10) : fileSize - 1;
+  }
+
+  if (
+    !Number.isFinite(start) ||
+    !Number.isFinite(end) ||
+    start < 0 ||
+    end < start ||
+    start >= fileSize
+  ) {
+    return null;
+  }
+
+  return { start, end: Math.min(end, fileSize - 1) };
+}
 
 // Small icon placeholder (57x57)
 router.get("/install/:id/icon-small.png", (_req: Request, res: Response) => {
