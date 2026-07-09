@@ -15,7 +15,11 @@ const execFile = promisify(execFileCb);
 interface IpaMetadata {
   bundleName: string;
   manifest: { sinfPaths: string[] } | null;
-  info: { bundleExecutable: string } | null;
+  info: {
+    bundleExecutable: string;
+    bundleVersion?: string;
+    bundleShortVersion?: string;
+  } | null;
 }
 
 export async function inject(
@@ -82,7 +86,7 @@ async function streamToBuffer(stream: Readable): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
-async function readIpaMetadata(ipaPath: string): Promise<IpaMetadata> {
+export async function readIpaMetadata(ipaPath: string): Promise<IpaMetadata> {
   const zip = await openZip(ipaPath);
   try {
     let bundleName: string | null = null;
@@ -140,14 +144,24 @@ async function readIpaMetadata(ipaPath: string): Promise<IpaMetadata> {
       }
     }
 
-    // Parse info plist
-    let info: { bundleExecutable: string } | null = null;
+    // Parse Info.plist để lấy executable và version thật cho manifest OTA.
+    let info: IpaMetadata["info"] = null;
     if (infoPlistData) {
       const parsed = parsePlistBuffer(infoPlistData);
       if (parsed) {
         const executable = parsed["CFBundleExecutable"];
         if (typeof executable === "string") {
-          info = { bundleExecutable: executable };
+          const bundleVersion = parsed["CFBundleVersion"];
+          const bundleShortVersion = parsed["CFBundleShortVersionString"];
+          info = {
+            bundleExecutable: executable,
+            bundleVersion:
+              typeof bundleVersion === "string" ? bundleVersion : undefined,
+            bundleShortVersion:
+              typeof bundleShortVersion === "string"
+                ? bundleShortVersion
+                : undefined,
+          };
         }
       }
     }
